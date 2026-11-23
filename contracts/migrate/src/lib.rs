@@ -31,6 +31,10 @@ pub mod errors;
 pub use errors::MigrationError;
 
 use callora_storage_migration::{
+    migration_stub::{
+        stub_authorize_upgrade, stub_get_current, stub_init, stub_is_upgrade_authorised,
+        stub_migrate, stub_version, MigrationStubError,
+    },
     zero_layout_hash, StorageMigrationError, StorageMigrationValidator,
 };
 use soroban_sdk::{contract, contractimpl, contracttype, Address, BytesN, Env};
@@ -74,6 +78,24 @@ pub struct CurrentData {
     pub reserved: i128,
 }
 
+impl From<MigrationStubError> for MigrationError {
+    fn from(e: MigrationStubError) -> Self {
+        match e {
+            MigrationStubError::NotInitialized => MigrationError::NotInitialized,
+            MigrationStubError::AlreadyInitialized => MigrationError::AlreadyInitialized,
+            MigrationStubError::Unauthorized => MigrationError::Unauthorized,
+            MigrationStubError::LegacyStateMissing => MigrationError::LegacyStateMissing,
+            MigrationStubError::InvalidLegacyBalance => MigrationError::InvalidLegacyBalance,
+            MigrationStubError::VersionMismatch => MigrationError::VersionMismatch,
+            MigrationStubError::InvalidTargetVersion => MigrationError::InvalidTargetVersion,
+            MigrationStubError::AlreadyMigrated => MigrationError::AlreadyMigrated,
+            MigrationStubError::UpgradeNotAuthorized => MigrationError::UpgradeNotAuthorized,
+            MigrationStubError::Overflow => MigrationError::VersionOverflow,
+            MigrationStubError::WasmHashZero => MigrationError::WasmHashZero,
+        }
+    }
+}
+
 /// Emergency data migration and upgrade guard.
 #[contract]
 pub struct EmergencyMigration;
@@ -90,26 +112,20 @@ impl EmergencyMigration {
     /// * [`MigrationError::InvalidInitialVersion`] — `initial_version > u32::MAX - 1024`.
     pub fn init(env: Env, admin: Address, initial_version: u32) -> Result<(), MigrationError> {
         admin.require_auth();
-        if env.storage().instance().has(&StorageKey::Admin) {
-            return Err(MigrationError::AlreadyInitialized);
-        }
         if initial_version > MAX_INITIAL_VERSION {
             return Err(MigrationError::InvalidInitialVersion);
         }
-        env.storage().instance().set(&StorageKey::Admin, &admin);
-        env.storage()
-            .instance()
-            .set(&StorageKey::Version, &initial_version);
-        Ok(())
+        stub_init(
+            &env,
+            StorageKey::Admin,
+            StorageKey::Version,
+            &admin,
+            initial_version,
+        )
+        .map_err(Into::into)
     }
 
     /// Reshape legacy emergency state and advance the migration version.
-    ///
-    /// The operation requires administrator authorization and is atomic from
-    /// the caller's perspective: the current record and version are written
-    /// only after all validation succeeds. The target must be exactly one
-    /// greater than `expected_version`, preventing skipped migrations and
-    /// replay of an already completed migration.
     ///
     /// # Errors
     /// * [`MigrationError::NotInitialized`] — `init` not called.
@@ -127,60 +143,40 @@ impl EmergencyMigration {
         target_version: u32,
     ) -> Result<CurrentData, MigrationError> {
         caller.require_auth();
-        let admin: Address = env
-            .storage()
-            .instance()
-            .get(&StorageKey::Admin)
-            .ok_or(MigrationError::NotInitialized)?;
-        if caller != admin {
-            return Err(MigrationError::Unauthorized);
-        }
-
-        let version: u32 = env
-            .storage()
-            .instance()
-            .get(&StorageKey::Version)
-            .ok_or(MigrationError::NotInitialized)?;
-        if version != expected_version {
-            return Err(MigrationError::VersionMismatch);
-        }
-        // Use checked_add to guard against version counter overflow.
-        let next_version = expected_version
-            .checked_add(1)
-            .ok_or(MigrationError::VersionOverflow)?;
-        if target_version != next_version {
-            return Err(MigrationError::InvalidTargetVersion);
-        }
-        if env.storage().instance().has(&StorageKey::Current) {
-            return Err(MigrationError::AlreadyMigrated);
-        }
-
-        let legacy: LegacyData = env
-            .storage()
-            .instance()
-            .get(&StorageKey::Legacy)
-            .ok_or(MigrationError::LegacyStateMissing)?;
-        if legacy.balance < 0 {
-            return Err(MigrationError::InvalidLegacyBalance);
-        }
-
-        let current = CurrentData {
-            balance: legacy.balance,
-            last_updated: legacy.last_updated,
-            reserved: 0,
-        };
-        env.storage().instance().set(&StorageKey::Current, &current);
+        stub_migrate(
+            &env,
+            StorageKey::Admin,
+            StorageKey::Version,
+            StorageKey::Current,
+            &caller,
+            expected_version,
+            target_version,
+            || -> Result<(), MigrationStubError> {
+                let legacy: LegacyData = env
+                    .storage()
+                    .instance()
+                    .get(&StorageKey::Legacy)
+                    .ok_or(MigrationStubError::LegacyStateMissing)?;
+                if legacy.balance < 0 {
+                    return Err(MigrationStubError::InvalidLegacyBalance);
+                }
+                let current = CurrentData {
+                    balance: legacy.balance,
+                    last_updated: legacy.last_updated,
+                    reserved: 0,
+                };
+                env.storage().instance().set(&StorageKey::Current, &current);
+                Ok(())
+            },
+        )
+        .map_err(MigrationError::from)?;
         env.storage()
             .instance()
-            .set(&StorageKey::Version, &target_version);
-        Ok(current)
+            .get(&StorageKey::Current)
+            .ok_or(MigrationError::MigrationDataCorrupted)
     }
 
     /// Authorize a contract upgrade for the current migration version.
-    ///
-    /// This is a guard only; it does not call `update_current_contract_wasm`.
-    /// The deployment tool must consume the returned authorization state and
-    /// perform the platform upgrade in a separate transaction.
     ///
     /// # Errors
     /// * [`MigrationError::NotInitialized`] — `init` not called.
@@ -194,79 +190,43 @@ impl EmergencyMigration {
         wasm_hash: BytesN<32>,
     ) -> Result<(), MigrationError> {
         caller.require_auth();
-        let admin: Address = env
-            .storage()
-            .instance()
-            .get(&StorageKey::Admin)
-            .ok_or(MigrationError::NotInitialized)?;
-        if caller != admin {
-            return Err(MigrationError::Unauthorized);
-        }
-        let version: u32 = env
-            .storage()
-            .instance()
-            .get(&StorageKey::Version)
-            .ok_or(MigrationError::NotInitialized)?;
-        if target_version != version {
-            return Err(MigrationError::VersionMismatch);
-        }
-        // Reject an all-zero hash — almost certainly a programming mistake.
-        if wasm_hash == BytesN::from_array(&env, &[0u8; 32]) {
-            return Err(MigrationError::WasmHashZero);
-        }
-        env.storage()
-            .instance()
-            .set(&StorageKey::AuthorizedUpgrade, &(target_version, wasm_hash));
-        Ok(())
+        stub_authorize_upgrade(
+            &env,
+            StorageKey::Admin,
+            StorageKey::Version,
+            StorageKey::AuthorizedUpgrade,
+            &caller,
+            target_version,
+            &wasm_hash,
+            true, // check zero hash
+        )
+        .map_err(Into::into)
     }
 
     /// Return the reshaped emergency state, if migration has completed.
     pub fn get_current(env: Env) -> Option<CurrentData> {
-        env.storage().instance().get(&StorageKey::Current)
+        stub_get_current(&env, StorageKey::Current)
     }
 
     /// Return the stored migration version, if initialized.
     pub fn version(env: Env) -> Option<u32> {
-        env.storage().instance().get(&StorageKey::Version)
+        stub_version(&env, StorageKey::Version)
     }
 
     /// Check whether a hash is authorized for the current migration version.
     pub fn is_upgrade_authorized(env: Env, wasm_hash: BytesN<32>) -> bool {
-        let version: Option<u32> = env.storage().instance().get(&StorageKey::Version);
-        let authorization: Option<(u32, BytesN<32>)> =
-            env.storage().instance().get(&StorageKey::AuthorizedUpgrade);
-        match (version, authorization) {
-            (Some(version), Some((authorized_version, authorized_hash))) => {
-                version == authorized_version && wasm_hash == authorized_hash
-            }
-            _ => false,
-        }
+        stub_is_upgrade_authorised(
+            &env,
+            StorageKey::Version,
+            StorageKey::AuthorizedUpgrade,
+            &wasm_hash,
+        )
     }
 
     /// Deterministic storage-migration validation that must run **before** the
     /// upgraded code is swapped in via `update_current_contract_wasm`.
     ///
-    /// This is the canonical pre-upgrade gate. The caller must be the configured
-    /// administrator and must authorize the call; unlike a read-only dry run,
-    /// success records the validator's upgrade authorization guard, so the
-    /// entrypoint is state-changing and must never be callable unauthenticated.
-    ///
-    /// After authentication it verifies, without mutating any *business* state,
-    /// that:
-    ///
-    /// * the replacement WASM hash is well-formed (rejects all-zero hashes);
-    /// * the target version is a single forward step (no skipped migrations)
-    ///   or, when `allow_rollback` is set, a sanctioned downgrade with a backup;
-    /// * any pinned source / target storage layouts are consistent.
-    ///
-    /// On success it records an authorization guard that deployment tooling can
-    /// verify via [`StorageMigrationValidator::is_upgrade_authorized`] before
-    /// performing the platform-level upgrade. The function returns
-    /// [`StorageMigrationError`] rather than panicking.
-    ///
-    /// Error precedence is **auth → admin → hash → version**: a missing
-    /// signature aborts first, then a non-admin caller is rejected before any
-    /// hash or version check can run.
+    /// Error precedence is **auth → admin → hash → version**.
     ///
     /// # Errors
     /// * [`StorageMigrationError::NotInitialized`] — `init` not called.
@@ -284,11 +244,7 @@ impl EmergencyMigration {
         wasm_hash: BytesN<32>,
         allow_rollback: bool,
     ) -> Result<(), StorageMigrationError> {
-        // Auth first: an unsigned call must never reach storage reads/writes.
         caller.require_auth();
-
-        // Admin second: reject before the hash/version checks so a non-admin
-        // cannot learn or influence validation state.
         let admin: Address = env
             .storage()
             .instance()
@@ -297,7 +253,6 @@ impl EmergencyMigration {
         if caller != admin {
             return Err(StorageMigrationError::Unauthorized);
         }
-
         let zero = zero_layout_hash(&env);
         StorageMigrationValidator::validate_before_upgrade(
             &env,
@@ -357,8 +312,6 @@ mod tests {
         let (admin, contract) = setup(&env);
         let client = EmergencyMigrationClient::new(&env, &contract);
         client.migrate(&admin, &7, &8);
-        // After migration, AlreadyMigrated must be raised (version is 8 so
-        // expected=8,target=9 passes version checks but current data exists).
         assert!(client.try_migrate(&admin, &8, &9).is_err());
     }
 
@@ -392,7 +345,6 @@ mod tests {
         let env = Env::default();
         let (admin, contract) = setup(&env);
         let client = EmergencyMigrationClient::new(&env, &contract);
-        // target = expected + 2 (skip not allowed)
         assert!(client.try_migrate(&admin, &7, &9).is_err());
     }
 
@@ -403,10 +355,8 @@ mod tests {
         let client = EmergencyMigrationClient::new(&env, &contract);
         let hash = BytesN::from_array(&env, &[9; 32]);
 
-        // Wrong version
         assert!(client.try_authorize_upgrade(&admin, &6, &hash).is_err());
 
-        // Correct version
         client.authorize_upgrade(&admin, &7, &hash);
         assert!(client.is_upgrade_authorized(&hash));
         assert!(!client.is_upgrade_authorized(&BytesN::from_array(&env, &[8; 32])));
@@ -430,7 +380,6 @@ mod tests {
         let admin = Address::generate(&env);
         let contract = env.register(EmergencyMigration, ());
         let client = EmergencyMigrationClient::new(&env, &contract);
-        // u32::MAX - 512 > MAX_INITIAL_VERSION (u32::MAX - 1024)
         assert!(client.try_init(&admin, &(u32::MAX - 512)).is_err());
     }
 
@@ -460,10 +409,7 @@ mod tests {
         let contract = env.register(EmergencyMigration, ());
         let client = EmergencyMigrationClient::new(&env, &contract);
 
-        // migrate before init
         assert!(client.try_migrate(&admin, &0, &1).is_err());
-
-        // authorize_upgrade before init
         let hash = BytesN::from_array(&env, &[1u8; 32]);
         assert!(client.try_authorize_upgrade(&admin, &0, &hash).is_err());
     }
@@ -488,12 +434,9 @@ mod tests {
         let admin = Address::generate(&env);
         let contract = env.register(EmergencyMigration, ());
         let client = EmergencyMigrationClient::new(&env, &contract);
-        // init without planting legacy data
         client.init(&admin, &0);
         assert!(client.try_migrate(&admin, &0, &1).is_err());
     }
-
-    // ── MigrationError variant coverage ───────────────────────────────────
 
     #[test]
     fn error_variants_have_stable_codes() {
@@ -522,9 +465,7 @@ mod tests {
         client.init(&admin, &7);
 
         let hash = BytesN::from_array(&env, &[9u8; 32]);
-        // Runs as a pre-upgrade gate and records an authorization guard.
         client.validate_before_upgrade(&admin, &7, &hash, &false);
-        // The recorded authorization can be checked by off-chain tooling.
         let authorized = env.as_contract(&contract, || {
             StorageMigrationValidator::is_upgrade_authorized(&env, 7, &hash)
         });
@@ -573,13 +514,6 @@ mod tests {
         );
     }
 
-    /// Regression proof for the forge described in issue #1415.
-    ///
-    /// On `main`, an unauthenticated `validate_before_upgrade(v, H')` wrote
-    /// `H'` into the same `AuthorizedUpgrade` slot read by
-    /// `is_upgrade_authorized`, overwriting the admin's real authorization.
-    /// The entrypoint is now admin-only and the validator keys are namespaced,
-    /// so the attacker call fails and the admin's hash remains authorized.
     #[test]
     fn forged_validation_cannot_overwrite_admin_authorization() {
         let env = Env::default();
@@ -598,7 +532,6 @@ mod tests {
             StorageMigrationError::Unauthorized
         );
 
-        // The admin's authorization is intact and the forged hash is not valid.
         assert!(client.is_upgrade_authorized(&good_hash));
         assert!(!client.is_upgrade_authorized(&evil_hash));
         let validator_evil = env.as_contract(&contract, || {
@@ -607,7 +540,6 @@ mod tests {
         assert!(!validator_evil);
     }
 
-    /// Error precedence: auth → admin → hash → version.
     #[test]
     fn validation_error_precedence_is_auth_admin_hash_version() {
         let env = Env::default();
@@ -617,28 +549,24 @@ mod tests {
         let zero_hash = BytesN::from_array(&env, &[0u8; 32]);
         let good_hash = BytesN::from_array(&env, &[9u8; 32]);
 
-        // 1. Missing auth wins over everything.
         env.set_auths(&[]);
         assert!(client
             .try_validate_before_upgrade(&admin, &9, &zero_hash, &false)
             .is_err());
         env.mock_all_auths();
 
-        // 2. Non-admin is rejected before the hash / version checks.
         let res = client.try_validate_before_upgrade(&intruder, &9, &zero_hash, &false);
         assert_eq!(
             res.unwrap_err().unwrap(),
             StorageMigrationError::Unauthorized
         );
 
-        // 3. Admin + zero hash + bad version: hash is checked first.
         let res = client.try_validate_before_upgrade(&admin, &9, &zero_hash, &false);
         assert_eq!(
             res.unwrap_err().unwrap(),
             StorageMigrationError::WasmHashZero
         );
 
-        // 4. Admin + good hash + skipped version: version check runs last.
         let res = client.try_validate_before_upgrade(&admin, &9, &good_hash, &false);
         assert_eq!(
             res.unwrap_err().unwrap(),

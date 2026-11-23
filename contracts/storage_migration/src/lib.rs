@@ -49,8 +49,10 @@
 //!   [`StorageMigrationError::BackupMissing`]).
 
 pub mod error;
+pub mod migration_stub;
 
 pub use error::StorageMigrationError;
+pub use migration_stub::MigrationStubError;
 
 use soroban_sdk::{contracttype, Bytes, BytesN, Env};
 
